@@ -43,6 +43,7 @@ local S={
 	hopPingMax=150, hopFpsMin=30,
 	hopSkipFull=true, hopSkipVisit=true,
 	hopAutoPing=false, hopPingLimit=200, hopMaxTry=6,
+	cfgAuto=false, -- auto-load konfigurasi tersimpan saat script jalan/teleport
 }
 local SavedWS, SavedJP = 16, 50
 local SpeedDirty, JumpDirty = false, false
@@ -157,6 +158,7 @@ end
 -- ================= WIDGETS =================
 local ord=0
 local togPainters={}
+local togCbs={}
 local slideRegs={}
 local function sect(page,txt)
 	ord=ord+1
@@ -175,6 +177,7 @@ local function tog(page,txt,key,cb)
 	paint()
 	togPainters[key]=togPainters[key] or {}
 	table.insert(togPainters[key],paint)
+	if cb then togCbs[key]=cb end
 	b.MouseButton1Click:Connect(function()
 		S[key]=not S[key]
 		paint()
@@ -256,8 +259,8 @@ tabBtns['Gerak'].BackgroundColor3=Color3.fromRGB(45,90,160)
 
 -- ================= ISI =================
 sect(pages['Gerak'],'KECEPATAN (tulis hanya saat digeser)')
-slide(pages['Gerak'],'WalkSpeed',16,300,16,function(v) SavedWS=v SpeedDirty=true local c=lp.Character local h=c and c:FindFirstChildOfClass('Humanoid') if h then h.WalkSpeed=v end end)
-slide(pages['Gerak'],'JumpPower',50,300,50,function(v) SavedJP=v JumpDirty=true local c=lp.Character local h=c and c:FindFirstChildOfClass('Humanoid') if h then if not h.UseJumpPower then h.UseJumpPower=true end h.JumpPower=v end end)
+slide(pages['Gerak'],'WalkSpeed',16,300,16,function(v) SavedWS=v SpeedDirty=true local c=lp.Character local h=c and c:FindFirstChildOfClass('Humanoid') if h then h.WalkSpeed=v end end,'ws')
+slide(pages['Gerak'],'JumpPower',50,300,50,function(v) SavedJP=v JumpDirty=true local c=lp.Character local h=c and c:FindFirstChildOfClass('Humanoid') if h then if not h.UseJumpPower then h.UseJumpPower=true end h.JumpPower=v end end,'jp')
 sect(pages['Gerak'],'TERBANG')
 slide(pages['Gerak'],'Fly Speed',20,200,70,function(v) S.flySpd=v end)
 tog(pages['Gerak'],'Fly (WASD + Spasi)','fly',function(on) setFly(on) end)
@@ -1201,15 +1204,124 @@ UIS.InputBegan:Connect(function(io,gp)
 	end
 end)
 
--- Jalan otomatis lagi setelah pindah lobby <-> match (teleport antar place)
+-- Jalan otomatis lagi setelah pindah lobby <-> match (teleport antar place).
+-- Sumber skrip = GitHub raw (versi terbaru, path "%20" = spasi di nama file);
+-- fallback file lokal kalau GitHub gagal.
+local GH_RAW='https://raw.githubusercontent.com/SanggonBoy/Fluxo-PVP/main/Fluxo%20PVP.lua'
+local LOCAL_F='D:/New Downloads/RobloxForFun/Fluxo PVP/Fluxo PVP.lua'
 pcall(function()
 	if queue_on_teleport then
-		queue_on_teleport("loadstring(readfile('D:/New Downloads/RobloxForFun/Fluxo PVP/Fluxo PVP.lua'))()")
+		queue_on_teleport(([==[
+local req=getgenv().request
+if req then
+	local ok,res=pcall(req,{Url='%s',Method='GET'})
+	if ok and type(res)=='table' and res.StatusCode==200 and type(res.Body)=='string' and #res.Body>1000 then
+		loadstring(res.Body)()
+		return
+	end
+end
+pcall(function() loadstring(readfile('%s'))() end)
+]==]):format(GH_RAW,LOCAL_F))
 	end
 end)
 
--- Helper console: FLX_SET('espM',true) / FLX_GET() dari executor
+-- ================= KONFIGURASI (save / load / auto) =================
+-- Semua fitur default OFF tiap eksekusi baru (konvensi AGENTS.md). Save menulis
+-- state S + WS/JP ke file JSON; toggle Auto ON = config langsung dipakai saat
+-- script dijalankan lagi (eksekusi manual / queue_on_teleport pasca-teleport).
+local CFGPATH='FluxoPVP-config.json'
+local function cfgSnapshot()
+	local c={SavedWS=SavedWS,SavedJP=SavedJP}
+	for k,v in pairs(S) do
+		if type(v)=='boolean' or type(v)=='number' then c[k]=v end
+	end
+	return c
+end
+local function applyCfg(c)
+	if type(c)~='table' then return 0 end
+	local n=0
+	for k,v in pairs(c) do
+		if k~='SavedWS' and k~='SavedJP' and S[k]~=nil and type(S[k])==type(v) then
+			S[k]=v n=n+1
+		end
+	end
+	-- slider: jalankan cb-nya supaya label + efek ikut (ws/jp pakai key 'ws'/'jp')
+	for _,r in ipairs(slideRegs) do
+		if r.key=='ws' and type(c.SavedWS)=='number' then pcall(r.set,c.SavedWS)
+		elseif r.key=='jp' and type(c.SavedJP)=='number' then pcall(r.set,c.SavedJP)
+		elseif r.key and S[r.key] then pcall(r.set,S[r.key]) end
+	end
+	-- repaint toggle + jalankan efeknya (kecuali cfgAuto: hindari save-during-load)
+	for k,ps in pairs(togPainters) do for _,p in ipairs(ps) do pcall(p) end end
+	for k,cb in pairs(togCbs) do
+		if k~='cfgAuto' then pcall(cb,S[k]) end
+	end
+	pcall(saveHP)
+	return n
+end
+local function doSave()
+	local ok,err=pcall(function()
+		game:GetService('HttpService'):JSONEncode(cfgSnapshot()) -- validasi dulu
+		writefile(CFGPATH,game:GetService('HttpService'):JSONEncode(cfgSnapshot()))
+	end)
+	if ok then
+		log('Config disimpan ('..CFGPATH..').')
+		showToast('💾 Config disimpan',Color3.fromRGB(120,255,160))
+	else
+		log('Gagal simpan: '..tostring(err))
+		showToast('💾 Gagal simpan',Color3.fromRGB(255,120,120))
+	end
+end
+local function doLoad(quiet)
+	local ok,raw=pcall(function() return readfile(CFGPATH) end)
+	if not ok or type(raw)~='string' or raw=='' then
+		log('Belum ada config. Tekan Save dulu.')
+		if not quiet then showToast('📂 Belum ada config',Color3.fromRGB(255,200,100)) end
+		return false
+	end
+	local ok2,c=pcall(function() return game:GetService('HttpService'):JSONDecode(raw) end)
+	if not ok2 or type(c)~='table' then
+		log('Config rusak (JSON tidak valid).')
+		if not quiet then showToast('📂 Config rusak',Color3.fromRGB(255,120,120)) end
+		return false
+	end
+	local n=applyCfg(c)
+	log('Config dimuat: '..n..' nilai.')
+	showToast('📂 Config dimuat ('..n..')',Color3.fromRGB(120,255,160))
+	return true
+end
+sect(pages['Lain'],'KONFIGURASI (simpan / muat ulang)')
+tog(pages['Lain'],'Auto-load config saat script jalan','cfgAuto',function(on)
+	if on then
+		doSave()
+		log('Auto-load AKTIF: config dipakai otomatis saat eksekusi/teleport berikutnya.')
+	else
+		log('Auto-load MATI: config tetap tersimpan, muat manual via tombol Load.')
+	end
+end)
+btn(pages['Lain'],'💾 Save konfigurasi (tulis file)',doSave)
+btn(pages['Lain'],'📂 Load konfigurasi (terapkan)',function() doLoad(false) end)
+btn(pages['Lain'],'🗑 Hapus file konfigurasi',function()
+	pcall(function() delfile(CFGPATH) end)
+	log('File config dihapus.')
+	showToast('🗑 Config dihapus',Color3.fromRGB(255,200,100))
+end)
+-- Boot: kalau config bilang Auto ON → langsung terapkan (tanpa klik apa pun).
+task.spawn(function()
+	task.wait(0.5)
+	local ok,raw=pcall(function() return readfile(CFGPATH) end)
+	if not ok or type(raw)~='string' or raw=='' then return end
+	local ok2,c=pcall(function() return game:GetService('HttpService'):JSONDecode(raw) end)
+	if not ok2 or type(c)~='table' or c.cfgAuto~=true then return end
+	local n=applyCfg(c)
+	log('Auto-load config: '..n..' nilai diterapkan.')
+	showToast('📂 Config auto-load ('..n..')',Color3.fromRGB(120,255,160))
+end)
+
+-- Helper console: FLX_SET('espM',true) / FLX_GET() / FLX_SAVE() / FLX_LOAD() dari executor
 ENV.FLX_SET=function(k,v) if S[k]==nil then return false end S[k]=v for _,p in ipairs(togPainters[k] or {}) do pcall(p) end if k=='fly' then setFly(v) end return true end
 ENV.FLX_GET=function() local c={} for k,v in pairs(S) do c[k]=v end return c end
+ENV.FLX_SAVE=doSave
+ENV.FLX_LOAD=function() return doLoad(false) end
 
 print('[FLX] v1 Loaded! Insert / RightShift = tampil/sembunyi. Tab Tempur: aimbot/triggerbot/ESP.')

@@ -1126,11 +1126,30 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ================= TRIGGERBOT =================
+-- mouse1click = klik OS-level: tembus keluar Roblox (Chrome ikut ke-klik) bila
+-- dipicu saat window tidak fokus / HUD terbuka / di lobby. Guard di bawah wajib.
 local trigBusy=false
+local winFocused=true
+pcall(function()
+	UIS.WindowFocused:Connect(function() winFocused=true end)
+	UIS.WindowFocusReleased:Connect(function() winFocused=false end)
+end)
+local function trigGuards()
+	if not winFocused then return false end
+	if main.Visible or CursorFree then return false end
+	local typing=false
+	pcall(function() typing=UIS:GetFocusedTextBox()~=nil end)
+	if typing then return false end
+	local c=lp.Character
+	local h=c and c:FindFirstChildOfClass('Humanoid')
+	if not h or h.Health<=0 then return false end
+	if not c:FindFirstChildOfClass('Tool') then return false end -- di match senjata terpasang; di lobby tidak
+	return true
+end
 task.spawn(function()
 	while true do
 		if ENV.FLX_GEN~=MYGEN then return end
-		if S.trig and not trigBusy then
+		if S.trig and not trigBusy and trigGuards() then
 			local ok=pcall(function()
 				local cam=Workspace.CurrentCamera
 				if not cam then return end
@@ -1142,9 +1161,22 @@ task.spawn(function()
 					if m and enemyOK(m,playerOfChar(m)) then
 						trigBusy=true
 						task.wait(S.trigDelay/1000)
-						if mouse1click then pcall(mouse1click)
-						elseif mouse1press and mouse1release then
-							pcall(function() mouse1press() task.wait(0.05) mouse1release() end)
+						-- verifikasi ulang sesaat sebelum klik: guard + target masih sama
+						local fire=false
+						if trigGuards() then
+							local cam2=Workspace.CurrentCamera
+							if cam2 then
+								rparams.FilterDescendantsInstances={lp.Character}
+								local res2=Workspace:Raycast(cam2.CFrame.Position,cam2.CFrame.LookVector*500,rparams)
+								local m2=res2 and res2.Instance and res2.Instance:FindFirstAncestorOfClass('Model')
+								fire=(m2==m)
+							end
+						end
+						if fire then
+							if mouse1click then pcall(mouse1click)
+							elseif mouse1press and mouse1release then
+								pcall(function() mouse1press() task.wait(0.05) mouse1release() end)
+							end
 						end
 						task.wait(0.15)
 						trigBusy=false

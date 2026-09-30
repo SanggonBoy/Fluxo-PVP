@@ -38,6 +38,11 @@ local S={
 	aimFov=140, aimSmooth=8, fovShow=true,
 	trig=false, trigDelay=120,
 	espM=false, espB=false,
+	-- server hop
+	hopSepi=true, hopRamai=false,
+	hopPingMax=150, hopFpsMin=30,
+	hopSkipFull=true, hopSkipVisit=true,
+	hopAutoPing=false, hopPingLimit=200, hopMaxTry=6,
 }
 local SavedWS, SavedJP = 16, 50
 local SpeedDirty, JumpDirty = false, false
@@ -186,7 +191,7 @@ local function btn(page,txt,cb)
 	end)
 	return b
 end
-local function slide(page,txt,min,max,def,cb)
+local function slide(page,txt,min,max,def,cb,key)
 	ord=ord+1
 	local f=mk('Frame',{Size=UDim2.new(1,-4,0,48),BackgroundColor3=Color3.fromRGB(24,28,38),BorderSizePixel=0,LayoutOrder=ord},page)
 	cr(f,8)
@@ -211,7 +216,7 @@ local function slide(page,txt,min,max,def,cb)
 		fill.Size=UDim2.new(rel,0,1,0)
 		cb(v)
 	end
-	table.insert(slideRegs,{def=def,set=setVal})
+	table.insert(slideRegs,{key=key,def=def,set=setVal, min=min, max=max})
 	bar.InputBegan:Connect(function(io)
 		if io.UserInputType==Enum.UserInputType.MouseButton1 or io.UserInputType==Enum.UserInputType.Touch then hold=true set(io.Position.X) end
 	end)
@@ -230,7 +235,7 @@ cr(side,10)
 local body=mk('Frame',{Position=UDim2.new(0,146,0,46),Size=UDim2.new(1,-156,1,-56),BackgroundTransparency=1},main)
 local pages={}
 local tabBtns={}
-local tabDefs={'Gerak','Lihat','Tempur','Lain'}
+local tabDefs={'Gerak','Lihat','Tempur','Server','Lain'}
 for i,nm in ipairs(tabDefs) do
 	local b=mk('TextButton',{Size=UDim2.new(1,-12,0,36),Position=UDim2.new(0,6,0,(i-1)*42+8),Text=nm,Font=Enum.Font.Gotham,TextSize=13,TextColor3=Color3.fromRGB(200,195,190),BackgroundColor3=Color3.fromRGB(26,31,41),BorderSizePixel=0,AutoButtonColor=true},side)
 	cr(b,8)
@@ -322,6 +327,311 @@ btn(pages['Lain'],'🔄 Respawn',function()
 end)
 btn(pages['Lain'],'🔁 Rejoin',function()
 	TeleportService:TeleportToPlaceInstance(game.PlaceId,game.JobId,lp)
+end)
+
+-- ================= TAB SERVER (server hop) =================
+-- Terverifikasi live: GET https://games.roblox.com/v1/games/<placeId>/servers/Public
+-- TANPA token (pakai PlaceId, bukan GameId) balas {data=[{id,playing,maxPlayers,ping,fps}]}.
+-- 401 kalau pakai universeId, 429 kalau spam. HttpService:GetAsync diblokir executor,
+-- jadi HTTP lewat getgenv().request.
+-- Catatan: field `ping` dari API TIDAK sama dengan ping kamu — API = ping server
+-- backend, sedangkan ping kamu = Stats.Network.ServerStatsItem.Data Ping. Beda
+-- total (terverifikasi: API 101 vs ping nyata 388), jadi filter API ping tidak
+-- menjamin latensi nyata. Solusi: ukur ping nyata pasca-land dan jelek→hop lagi.
+local SH={busy=false}
+-- State chain hop lintas teleport (ENV bertahan via queue_on_teleport+reload).
+-- untilGood: lanjut mencari sampai ping nyata < limit; tryN: hitungan percobaan;
+-- landedAt: waktu mendarat (os.clock) untuk menunggu ping stabil dulu.
+ENV.FLX_HOP=ENV.FLX_HOP or {untilGood=false,tryN=1,landedAt=0,limit=200,maxTry=6}
+local HOP=ENV.FLX_HOP
+HOP.landedAt=os.clock() -- tiap load = baru mendarat (juga setelah teleport+reload)
+-- Preferensi server-hop bertahan lintas teleport (tanpa ini: set RAMAI → pindah →
+-- reload → balik default SEPI, dan "Pindah ke server terbaik" terasa tidak ngefek).
+local HP=ENV.FLX_HOPPREF
+if type(HP)=='table' then
+	S.hopSepi=HP.sep~=false
+	S.hopRamai=HP.ram==true
+	S.hopPingMax=HP.pmax or S.hopPingMax
+	S.hopFpsMin=HP.fmin or S.hopFpsMin
+	S.hopSkipFull=HP.sf~=false
+	S.hopSkipVisit=HP.sv~=false
+	S.hopAutoPing=HP.ap==true
+	S.hopPingLimit=HP.plim or S.hopPingLimit
+	S.hopMaxTry=HP.mt or S.hopMaxTry
+end
+local function curPing()
+	local p=nil
+	pcall(function()
+		local it=game:GetService('Stats').Network.ServerStatsItem:FindFirstChild('Data Ping')
+		p=it and it:GetValue()
+	end)
+	return p
+end
+local function saveHP()
+	ENV.FLX_HOPPREF={
+		sep=S.hopSepi,ram=S.hopRamai,pmax=S.hopPingMax,fmin=S.hopFpsMin,
+		sf=S.hopSkipFull,sv=S.hopSkipVisit,ap=S.hopAutoPing,plim=S.hopPingLimit,mt=S.hopMaxTry,
+	}
+end
+-- Catat ping nyata server ini di getgenv (bertahan lintas teleport) + blacklist jelek.
+local function rememberLastPing()
+	local j=game.JobId or ''
+	if #j<8 then return end
+	local p=curPing()
+	if not p or p<10 then return end
+	ENV.FLX_PING=ENV.FLX_PING or {}
+	ENV.FLX_PING[j]=math.floor(p)
+	if p>S.hopPingLimit then
+		ENV.FLX_BAD=ENV.FLX_BAD or {}
+		ENV.FLX_BAD[j]=math.floor(p)
+		ENV.FLX_VISITED=ENV.FLX_VISITED or {}
+		ENV.FLX_VISITED[j]=true
+	end
+end
+local function repaintTog(k)
+	for _,p in ipairs(togPainters[k] or {}) do pcall(p) end
+end
+ord=ord+1
+local srvInfo=mk('TextLabel',{Size=UDim2.new(1,-4,0,22),BackgroundTransparency=1,Text='…',Font=Enum.Font.GothamBold,TextSize=13,TextColor3=Color3.fromRGB(140,190,255),TextXAlignment=Enum.TextXAlignment.Left,LayoutOrder=ord},pages['Server'])
+ord=ord+1
+local srvStatus=mk('TextLabel',{Size=UDim2.new(1,-4,0,40),BackgroundColor3=Color3.fromRGB(24,28,38),Text='Siap. Tombol di bawah ambil daftar live dari API Roblox.',Font=Enum.Font.Gotham,TextSize=11,TextColor3=Color3.fromRGB(205,200,195),TextWrapped=true,TextYAlignment=Enum.TextYAlignment.Top,BorderSizePixel=0,LayoutOrder=ord},pages['Server'])
+cr(srvStatus,8)
+local function setSrvStatus(t,col)
+	srvStatus.Text=t
+	srvStatus.TextColor3=col or Color3.fromRGB(205,200,195)
+end
+local function srvRequest()
+	local ok,g=pcall(getgenv)
+	if ok and type(g)=='table' and type(g.request)=='function' then return g.request end
+	if type(request)=='function' then return request end
+	return nil
+end
+local function httpGet(url)
+	local f=srvRequest()
+	if not f then return nil,'request() tidak ada' end
+	for i=1,3 do
+		local ok,res=pcall(f,{Url=url,Method='GET'})
+		if ok and type(res)=='table' then
+			local code=tonumber(res.StatusCode) or 0
+			if code==200 and type(res.Body)=='string' then return res.Body end
+			if code==429 then task.wait(2*i)
+			else return nil,'HTTP '..code end
+		else task.wait(1) end
+	end
+	return nil,'HTTP gagal x3'
+end
+local function fetchServers()
+	local all,cursor={},nil
+	for page=1,4 do
+		local url='https://games.roblox.com/v1/games/'..game.PlaceId..'/servers/Public?sortOrder=Asc&limit=100'
+		if cursor then url=url..'&cursor='..cursor end
+		local body,err=httpGet(url)
+		if not body then return nil,err end
+		local okd,d=pcall(function() return game:GetService('HttpService'):JSONDecode(body) end)
+		if not okd or type(d)~='table' or type(d.data)~='table' then return nil,'JSON rusak' end
+		for _,s in ipairs(d.data) do all[#all+1]=s end
+		cursor=d.nextPageCursor
+		if not cursor then break end
+		task.wait(0.6)
+	end
+	return all
+end
+local function getFiltered()
+	local list,err=fetchServers()
+	if not list then return nil,err end
+	local cur=game.JobId
+	local vis=ENV.FLX_VISITED or {}
+	local out={}
+	local bad=ENV.FLX_BAD or {}
+	for _,s in ipairs(list) do
+		local fpsOK=(s.fps==nil) or (tonumber(s.fps) or 0)>=S.hopFpsMin
+		if s.id~=cur and type(s.id)=='string' and not bad[s.id]
+			and type(s.ping)=='number' and s.ping<=S.hopPingMax
+			and fpsOK
+			and (not S.hopSkipFull or (tonumber(s.playing) or 0)<(tonumber(s.maxPlayers) or 99))
+			and (not S.hopSkipVisit or not vis[s.id]) then
+			out[#out+1]=s
+		end
+	end
+	local mode=S.hopSepi and 'sep' or (S.hopRamai and 'ram' or nil)
+	table.sort(out,function(a,b)
+		if mode=='sep' and a.playing~=b.playing then return a.playing<b.playing end
+		if mode=='ram' and a.playing~=b.playing then return a.playing>b.playing end
+		if a.ping~=b.ping then return a.ping<b.ping end
+		return (tonumber(a.fps) or 0)>(tonumber(b.fps) or 0)
+	end)
+	return out
+end
+local function hopTo(s,autoChain)
+	if SH.busy then setSrvStatus('Masih memproses pindah…',Color3.fromRGB(255,200,100)) return end
+	SH.busy=true
+	rememberLastPing() -- blacklist server lama kalau ping-nya jelek
+	ENV.FLX_VISITED=ENV.FLX_VISITED or {}
+	ENV.FLX_VISITED[s.id]=true
+	HOP.tryN=autoChain and (HOP.tryN+1) or 1
+	HOP.limit=S.hopPingLimit
+	HOP.maxTry=S.hopMaxTry
+	if autoChain then HOP.untilGood=true end
+	setSrvStatus(string.format('Pindah → ping API %dms · %d/%d pemain · %s',
+		tonumber(s.ping) or 0,tonumber(s.playing) or 0,tonumber(s.maxPlayers) or 0,s.id:sub(1,8)),
+		Color3.fromRGB(120,255,160))
+	local ok,err=pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId,s.id,lp)
+	end)
+	if not ok then
+		SH.busy=false
+		HOP.untilGood=false
+		setSrvStatus('Gagal teleport: '..tostring(err),Color3.fromRGB(255,120,120))
+	end
+end
+-- Lanjut chain: setelah reload di server baru, tunggu ping stabil 8 detik; kalau
+-- masih jelek dan belum habis percobaan → hop lagi. Berhenti saat ping bagus.
+task.spawn(function()
+	while alive() do
+		task.wait(2)
+		if HOP.untilGood and not SH.busy and os.clock()-HOP.landedAt>8 then
+			local p=curPing()
+			if p and p>HOP.limit then
+				rememberLastPing()
+				if HOP.tryN>=HOP.maxTry then
+					HOP.untilGood=false
+					setSrvStatus('Berhenti setelah '..HOP.tryN..'x coba — semua server ping>='
+						..HOP.limit..'ms. Naikkan batas / jumlah percobaan.',Color3.fromRGB(255,200,100))
+				else
+					setSrvStatus('Percobaan #'..(HOP.tryN+1)..': ping nyata '..math.floor(p)
+						..'ms masih > '..HOP.limit..' → pindah lagi…',Color3.fromRGB(255,200,100))
+					task.wait(1)
+					local out,err=getFiltered()
+					if not out then
+						HOP.untilGood=false
+						setSrvStatus('Gagal: '..tostring(err),Color3.fromRGB(255,120,120))
+					elseif #out==0 then
+						HOP.untilGood=false
+						setSrvStatus('Tidak ada server cocok lagi — longgarkan filter.',Color3.fromRGB(255,200,100))
+					else
+						hopTo(out[1],true)
+					end
+				end
+			elseif p then
+				HOP.untilGood=false
+				setSrvStatus('Selesai: ping nyata '..math.floor(p)..'ms < '..HOP.limit..' ✅',Color3.fromRGB(120,255,160))
+			end
+		end
+	end
+end)
+local function hopPick(reason)
+	setSrvStatus('Mengambil daftar server…',Color3.fromRGB(150,160,180))
+	local out,err=getFiltered()
+	if not out then setSrvStatus('Gagal: '..tostring(err),Color3.fromRGB(255,120,120)) return end
+	if #out==0 then
+		setSrvStatus('Tidak ada server cocok (filter: ping api≤'..S.hopPingMax
+			..(S.hopSkipFull and ' · tanpa penuh' or '')
+			..(S.hopSkipVisit and ' · lewati yang pernah' or '')
+			..'). Naikkan "Maks ping"/"Jumlah percobaan" kalau mau coba terus.',Color3.fromRGB(255,200,100))
+		return
+	end
+	setSrvStatus(reason..' → kandidat teratas: ping API '..out[1].ping..'ms · '
+		..out[1].playing..'/'..out[1].maxPlayers..' · '..#out..' cocok')
+	hopTo(out[1],false)
+end
+sect(pages['Server'],'SERVER SEKARANG')
+sect(pages['Server'],'FILTER (daftar live dari API Roblox)')
+slide(pages['Server'],'Maks ping server (ms)',30,400,150,function(v) S.hopPingMax=v saveHP() end,'hopPingMax')
+slide(pages['Server'],'Min FPS server',0,60,30,function(v) S.hopFpsMin=v saveHP() end,'hopFpsMin')
+tog(pages['Server'],'Prioritas server SEPI','hopSepi',function(on)
+	if on then S.hopRamai=false repaintTog('hopRamai') end
+	saveHP()
+end)
+tog(pages['Server'],'Prioritas server RAMAI','hopRamai',function(on)
+	if on then S.hopSepi=false repaintTog('hopSepi') end
+	saveHP()
+end)
+tog(pages['Server'],'Lewati server penuh (isi = max)','hopSkipFull',function() saveHP() end)
+tog(pages['Server'],'Lewati server pernah dikunjungi','hopSkipVisit',function() saveHP() end)
+sect(pages['Server'],'PINDAH')
+btn(pages['Server'],'📋 Lihat kandidat (tanpa pindah)',function()
+	setSrvStatus('Mengambil daftar server…',Color3.fromRGB(150,160,180))
+	local out,err=getFiltered()
+	if not out then setSrvStatus('Gagal: '..tostring(err),Color3.fromRGB(255,120,120)) return end
+	if #out==0 then setSrvStatus('Tidak ada server cocok.',Color3.fromRGB(255,200,100)) return end
+	local t={}
+	for i=1,math.min(#out,5) do
+		t[#t+1]=string.format('#%d ping=%d %d/%d',
+			i,tonumber(out[i].ping) or 0,tonumber(out[i].playing) or 0,tonumber(out[i].maxPlayers) or 0)
+	end
+	setSrvStatus(#out..' cocok · '..table.concat(t,'  ·  '),Color3.fromRGB(120,255,160))
+end)
+btn(pages['Server'],'🔎 Pindah & cari sampai ping bagus',function()
+	HOP.untilGood=true
+	HOP.tryN=1
+	HOP.limit=S.hopPingLimit
+	HOP.maxTry=S.hopMaxTry
+	hopPick('Terbaik')
+end)
+btn(pages['Server'],'🎲 Pindah ke server acak (lolos filter)',function()
+	local out,err=getFiltered()
+	if not out then setSrvStatus('Gagal: '..tostring(err),Color3.fromRGB(255,120,120)) return end
+	if #out==0 then setSrvStatus('Tidak ada server cocok.',Color3.fromRGB(255,200,100)) return end
+	hopTo(out[math.random(#out)],false)
+end)
+btn(pages['Server'],'🧹 Lupakan blacklist ping',function()
+	ENV.FLX_BAD={}
+	ENV.FLX_PING={}
+	ENV.FLX_VISITED={}
+	rememberLastPing()
+	setSrvStatus('Blacklist ping dibersihkan (server ini akan ditandai lagi kalau jelek).',Color3.fromRGB(150,160,180))
+end)
+sect(pages['Server'],'AUTO-HOP (ping saya melonjak)')
+tog(pages['Server'],'Auto pindah saat ping > batas','hopAutoPing',function() saveHP() end)
+slide(pages['Server'],'Batas ping NYATA (ms)',100,500,200,function(v) S.hopPingLimit=v saveHP() end,'hopPingLimit')
+slide(pages['Server'],'Jumlah percobaan otomatis',1,12,6,function(v) S.hopMaxTry=v saveHP() end,'hopMaxTry')
+-- Sinkron tampilan dengan pref yang di-restore (toggle repaint + label slider)
+task.spawn(function()
+	task.wait(0.5)
+	for _,k in ipairs({'hopSepi','hopRamai','hopSkipFull','hopSkipVisit','hopAutoPing'}) do
+		for _,p in ipairs(togPainters[k] or {}) do pcall(p) end
+	end
+	for _,r in ipairs(slideRegs) do
+		if r.key and S[r.key] then pcall(r.set, S[r.key]) end
+	end
+end)
+-- info ping/karateristik server sekarang (Stats = ping asli ke server ini)
+task.spawn(function()
+	while alive() do
+		task.wait(2)
+		local p=nil
+		pcall(function()
+			local it=game:GetService('Stats').Network.ServerStatsItem:FindFirstChild('Data Ping')
+			p=it and it:GetValue()
+		end)
+		if srvInfo then
+			local jp=(#game.JobId>0) and game.JobId:sub(1,8) or '-'
+			srvInfo.Text=string.format('Ping %s · Pemain %d/%d · Job %s',
+				p and math.floor(p)..'ms' or '?',
+				#Players:GetPlayers(),Players.MaxPlayers,jp)
+			srvInfo.TextColor3=(p and p>=200) and Color3.fromRGB(255,120,120)
+				or (p and p>=100 and Color3.fromRGB(255,200,100) or Color3.fromRGB(120,255,160))
+		end
+	end
+end)
+-- auto-hop: cek ping tiap 2s, ambil server baru max 1x/10s
+task.spawn(function()
+	local lastAuto=0
+	while alive() do
+		task.wait(2)
+		if S.hopAutoPing and not SH.busy and os.clock()-lastAuto>10 then
+			local p=nil
+			pcall(function()
+				local it=game:GetService('Stats').Network.ServerStatsItem:FindFirstChild('Data Ping')
+				p=it and it:GetValue()
+			end)
+			if p and p>S.hopPingLimit then
+				lastAuto=os.clock()
+				setSrvStatus('Ping '..math.floor(p)..'ms > '..S.hopPingLimit..' → cari server baru…',Color3.fromRGB(255,200,100))
+				hopPick('Auto-hop')
+			end
+		end
+	end
 end)
 
 -- ================= LOGIKA =================

@@ -4,6 +4,13 @@
 -- (Tool GlockInitial2 + CombatService RE), map voting + round system.
 -- Toggle: Insert / RightShift / tombol FX. Semua default OFF, tidak menulis
 -- gerakan sebelum user menyentuh slider (pola anti-flicker + anti dobel-jalan).
+-- GUARD: queue_on_teleport Xeno bersifat GLOBAL (bukan per-game). Tanpa guard
+-- PlaceId di bawah, file ini dieksekusi ulang di game LAIN saat pindah game →
+-- HUD Fluxo muncul di game yang salah (bug 2026-10-02). PlaceId resmi 99001115434148.
+if game.PlaceId~=99001115434148 and game.GameId~=8856451375 then
+	warn('[FLX] Dilewati: cheat ini untuk Fluxo PVP, bukan game lain (place '..tostring(game.PlaceId)..')')
+	return
+end
 
 local Players=game:GetService('Players')
 local RS=game:GetService('ReplicatedStorage')
